@@ -1,6 +1,6 @@
 {application, aaa_server,
  [{description, "3GPP AAA Server — VoWiFi / Carrier-Wi-Fi (SWm/SWx/S6b/STa per TS 29.273)"},
-  {vsn, "0.1.23"},
+  {vsn, "0.1.24"},
   {modules, [aaa_app, aaa_sup, aaa_config,
              aaa_diameter_svc,
              aaa_swm_server, aaa_swx_client, aaa_s6b_server, aaa_sta_server,

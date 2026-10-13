@@ -263,7 +263,7 @@ add_listener(Name, Port, TStr, #state{listeners = L} = State) ->
         {transport_module, TMod},
         {transport_config, [{reuseaddr, true},
                             {ip, {0,0,0,0}},
-                            {port, Port}]}
+                            {port, Port}] ++ socket_opts(TMod)}
     ]}),
     case Result of
         {ok, Ref} ->
@@ -297,7 +297,7 @@ try_connect_swx(Host, #state{dra_port = Port, dra_transport_mod = TMod,
             case diameter:add_transport(?SVC, {connect, [
                 {transport_module, TMod},
                 {transport_config, [{raddr, IP}, {rport, Port},
-                                    {ip, {0,0,0,0}}]},
+                                    {ip, {0,0,0,0}}] ++ socket_opts(TMod)},
                 {reconnect_timer, 5000},
                 %% Advertise ALL AAA-served apps on this transport.
                 %% The DRA reuses this TCP connection to relay SWm DERs
@@ -335,6 +335,14 @@ try_connect_swx(Host, #state{dra_port = Port, dra_transport_mod = TMod,
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+%% gen_sctp opens its sockets with a 1024 byte receive buffer. The AAA
+%% server then advertised a receive window of about 1.3 kB to the DRA, less
+%% than one SWx answer with user data, and the DRA's send queue towards it
+%% filled up under load until SWx requests timed out. Nagle is off per
+%% RFC 3539 section 3.2. The kernel caps recbuf at net.core.rmem_max.
+socket_opts(diameter_sctp) -> [{sctp_nodelay, true}, {recbuf, 262144}];
+socket_opts(_)             -> [].
 
 transport_module("sctp") -> diameter_sctp;
 transport_module("tcp")  -> diameter_tcp;
