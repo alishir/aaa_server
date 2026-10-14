@@ -34,11 +34,16 @@
 
 -export([start_link/0,
          create_session/1, update_session/2, get_session/1,
-         get_sessions_for_imsi/1, sessions_by_interface/1,
+         get_sessions_for_imsi/1, indexed_sessions_for_imsi/1,
+         sessions_by_interface/1,
          remove_session/1, remove_sessions_for_imsi/1,
+         supersede_sessions/4,
+         str_followup/2, end_session/2,
          bind_nai/2, resolve_nai/1,
          count/0, count/1,
-         list_all/0]).
+         list_all/0,
+         %% The periodic clean-up, callable from the test suite.
+         run_cleanup/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -53,6 +58,12 @@
 %% live without being refreshed. Individual sessions carry their own
 %% TTL; the index TTL is a safety-net so orphaned sets don't pile up.
 -define(INDEX_TTL_MARGIN_SEC, 600).
+
+%% The clean-up reads every session blob of an interface. In chunks, so
+%% one reply stays small, and under a lock so only one AAA pod per
+%% minute does it (KI-46: one MGET of all sessions per pod and minute).
+-define(PRUNE_CHUNK, 500).
+-define(PRUNE_LOCK_TTL_SEC, 55).
 
 %%====================================================================
 %% API
@@ -82,6 +93,14 @@ create_session(#aaa_session{session_id = SessionId,
         {ok, _} ->
             aaa_metrics:inc(sessions_created_total),
             ok;
+        {error, <<"OOM", _/binary>> = Reason} ->
+            %% Redis is at `maxmemory' with `noeviction': the store is
+            %% full. Reported separately so the capacity alarm is not
+            %% mistaken for a connection problem.
+            aaa_metrics:inc(redis_oom_errors_total),
+            logger:error("aaa_session_mgr:create_session: session store full "
+                         "sid=~s: ~s", [SessionId, Reason]),
+            {error, redis_oom};
         {error, Reason} = E ->
             logger:warning("aaa_session_mgr:create_session failed sid=~s reason=~p",
                            [SessionId, Reason]),
@@ -150,6 +169,80 @@ get_sessions_for_imsi(IMSI0) ->
             end
     end.
 
+%% @doc Like get_sessions_for_imsi/1 but from the index only, without
+%% the keyspace scan fallback. For the hot path (a new attach of an IMSI
+%% that has no session is the common case, and must not scan).
+-spec indexed_sessions_for_imsi(binary() | list()) -> [#aaa_session{}].
+indexed_sessions_for_imsi(IMSI0) ->
+    case normalize_identity(IMSI0) of
+        undefined -> [];
+        IMSI ->
+            Ids = lists:usort(lists:append([smembers_ids(K) || K <- imsi_aliases(IMSI)])),
+            mget_sessions(Ids)
+    end.
+
+%% @doc What the AAA does after a session on `Iface' ended, given the
+%% sessions of the IMSI that remain (TS 29.273 clauses 7, 8 and 9):
+%%
+%%   * `sar_deregistration': no session on any interface is left, so the
+%%     HSS is told that the user left non-3GPP access (SWx SAR type 5).
+%%     Up to 0.1.25 every SWm or S6b STR sent that SAR at once, while the
+%%     other interface still held the user's session (KI-46).
+%%   * `{swm_asr, S}': the S6b session ended (the PGW released the PDN
+%%     connection) while the SWm session S remains: the ePDG is told to
+%%     end the tunnel (clause 7.2.2.3). Deferred a few seconds, because a
+%%     normal detach makes the PGW's S6b STR and the ePDG's SWm STR race.
+%%   * `{s6b_grace, S}': the SWm session ended while the S6b session S
+%%     remains. No S6b ASR: the ePDG's S2b Delete makes the PGW send its
+%%     own STR. If S is still there after the grace period it is removed.
+%%
+%% Pure, so the rule is testable without Diameter.
+-spec str_followup(swm | sta | s6b, [#aaa_session{}]) ->
+          [sar_deregistration | {swm_asr, #aaa_session{}} | {s6b_grace, #aaa_session{}}].
+str_followup(_Iface, []) ->
+    [sar_deregistration];
+str_followup(Iface, Remaining) ->
+    [{swm_asr, S} || Iface =:= s6b,
+                     #aaa_session{interface = swm} = S <- Remaining] ++
+    [{s6b_grace, S} || Iface =/= s6b,
+                       #aaa_session{interface = s6b} = S <- Remaining].
+
+%% @doc Remove the session `Sid' of `Iface' and return what has to follow
+%% (see str_followup/2). `error' when the session is unknown.
+-spec end_session(swm | sta | s6b, binary()) ->
+          {ok, #aaa_session{}, [term()]} | error.
+end_session(Iface, Sid) ->
+    case get_session(Sid) of
+        {ok, #aaa_session{imsi = IMSI} = S} ->
+            remove_loaded(S),
+            Remaining = [R || R <- indexed_sessions_for_imsi(IMSI),
+                              R#aaa_session.session_id =/= Sid],
+            {ok, S, str_followup(Iface, Remaining)};
+        error ->
+            error
+    end.
+
+%% @doc A new session replaces the older sessions of the same IMSI on the
+%% same interface (TS 29.273: the 3GPP AAA Server keeps one SWm session
+%% per UE and one S6b session per PDN connection). On S6b only sessions
+%% of the same APN are replaced, a UE may hold several PDN connections.
+%% Without this every re-attach left its predecessors in the store for
+%% the established-session lifetime (KI-46). Returns the removed ids.
+-spec supersede_sessions(swm | sta | s6b, binary() | list() | undefined,
+                         binary(), binary() | undefined) -> [binary()].
+supersede_sessions(_Iface, undefined, _NewSid, _APN) -> [];
+supersede_sessions(Iface, IMSI, NewSid, APN) ->
+    Old = [S || #aaa_session{session_id = Sid, interface = I} = S
+                    <- indexed_sessions_for_imsi(IMSI),
+                I =:= Iface, Sid =/= NewSid,
+                Iface =/= s6b orelse S#aaa_session.apn =:= APN],
+    lists:foreach(fun remove_loaded/1, Old),
+    case Old of
+        [] -> ok;
+        _  -> aaa_metrics:inc(sessions_superseded_total, length(Old))
+    end,
+    [S#aaa_session.session_id || S <- Old].
+
 -spec sessions_by_interface(swm | sta | s6b) -> [#aaa_session{}].
 sessions_by_interface(Iface) ->
     case aaa_redis:smembers(iface_key(Iface)) of
@@ -161,29 +254,35 @@ sessions_by_interface(Iface) ->
 -spec remove_session(binary()) -> ok.
 remove_session(SessionId) ->
     case get_session(SessionId) of
-        {ok, #aaa_session{imsi = IMSI, interface = Iface}} ->
-            %% NB: lists:append/1 (one-level flatten) — lists:flatten/1
-            %% would dissolve each command list into its binaries and
-            %% break the MULTI pipeline.
-            Cmds = lists:append([
-                [[<<"DEL">>, sess_key(SessionId)]],
-                case IMSI of
-                    undefined -> [];
-                    _ ->
-                        [[<<"SREM">>, imsi_key(K), SessionId]
-                         || K <- imsi_aliases(IMSI)]
-                end,
-                case Iface of
-                    undefined -> [];
-                    _ -> [[<<"SREM">>, iface_key(Iface), SessionId]]
-                end
-            ]),
-            _ = aaa_redis:multi(Cmds),
-            ok;
+        {ok, S} ->
+            remove_loaded(S);
         error ->
             _ = aaa_redis:del(sess_key(SessionId)),
             ok
     end.
+
+%% Remove a session whose record is already loaded: the blob and its
+%% entries in the IMSI alias sets and the interface set.
+remove_loaded(#aaa_session{session_id = SessionId, imsi = IMSI,
+                           interface = Iface}) ->
+    %% NB: lists:append/1 (one-level flatten) — lists:flatten/1
+    %% would dissolve each command list into its binaries and
+    %% break the MULTI pipeline.
+    Cmds = lists:append([
+        [[<<"DEL">>, sess_key(SessionId)]],
+        case IMSI of
+            undefined -> [];
+            _ ->
+                [[<<"SREM">>, imsi_key(K), SessionId]
+                 || K <- imsi_aliases(IMSI)]
+        end,
+        case Iface of
+            undefined -> [];
+            _ -> [[<<"SREM">>, iface_key(Iface), SessionId]]
+        end
+    ]),
+    _ = aaa_redis:multi(Cmds),
+    ok.
 
 %% @doc Remove every session for an IMSI and return the list that was
 %% removed (callers in `aaa_swx_client' use the list to emit SWm ASR
@@ -272,20 +371,30 @@ handle_call(_Req, _From, State) -> {reply, ok, State}.
 handle_cast(_Msg, State)        -> {noreply, State}.
 
 handle_info(cleanup, State) ->
-    try
-        prune_interface_sets()
-    catch
-        Class:Reason:Stack ->
-            logger:warning("aaa_session_mgr cleanup failed ~p:~p ~P",
-                           [Class, Reason, Stack, 10])
-    end,
-    refresh_active_gauge(),
+    run_cleanup(),
     erlang:send_after(?CLEANUP_INTERVAL_MS, self(), cleanup),
     {noreply, State};
 handle_info(_Info, State) -> {noreply, State}.
 
 terminate(_Reason, _State) -> ok.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.
+
+%% @doc One clean-up pass: prune the interface sets (one pod per minute)
+%% and refresh the session gauges (every pod).
+-spec run_cleanup() -> ok.
+run_cleanup() ->
+    try
+        case claim_prune_lock() of
+            true  -> prune_interface_sets();
+            false -> ok
+        end
+    catch
+        Class:Reason:Stack ->
+            logger:warning("aaa_session_mgr cleanup failed ~p:~p ~P",
+                           [Class, Reason, Stack, 10])
+    end,
+    refresh_active_gauge(),
+    ok.
 
 %%====================================================================
 %% Key helpers
@@ -519,12 +628,29 @@ prune_iface(Iface) ->
         _          -> ok
     end.
 
+prune_iface_ids(_Iface, []) -> ok;
 prune_iface_ids(Iface, Ids) ->
-    case aaa_redis:q([<<"MGET">> | [sess_key(Id) || Id <- Ids]]) of
-        {ok, Blobs} when is_list(Blobs), length(Blobs) =:= length(Ids) ->
-            Dead = [Id || {Id, undefined} <- lists:zip(Ids, Blobs)],
-            remove_dead_members(Iface, Dead);
+    {Chunk, Rest} = case length(Ids) > ?PRUNE_CHUNK of
+        true  -> lists:split(?PRUNE_CHUNK, Ids);
+        false -> {Ids, []}
+    end,
+    case aaa_redis:q([<<"MGET">> | [sess_key(Id) || Id <- Chunk]]) of
+        {ok, Blobs} when is_list(Blobs), length(Blobs) =:= length(Chunk) ->
+            Dead = [Id || {Id, undefined} <- lists:zip(Chunk, Blobs)],
+            remove_dead_members(Iface, Dead),
+            prune_iface_ids(Iface, Rest);
         _ -> ok
+    end.
+
+%% SET NX with a TTL: the first pod of the minute prunes, the others skip.
+%% A failed Redis call counts as "not claimed", so a pod never prunes
+%% while the store is in trouble.
+claim_prune_lock() ->
+    Key = aaa_redis:key([<<"gc:lock">>]),
+    case aaa_redis:q([<<"SET">>, Key, atom_to_binary(node(), utf8),
+                      <<"NX">>, <<"EX">>, integer_to_binary(?PRUNE_LOCK_TTL_SEC)]) of
+        {ok, <<"OK">>} -> true;
+        _              -> false
     end.
 
 remove_dead_members(_Iface, []) -> ok;
@@ -534,6 +660,12 @@ remove_dead_members(Iface, Dead) ->
     ok.
 
 refresh_active_gauge() ->
-    Total = count(),
-    aaa_metrics:gauge_set(active_sessions, Total),
+    Counts = [{I, count(I)} || I <- [swm, sta, s6b]],
+    lists:foreach(fun({I, N}) -> aaa_metrics:gauge_set(gauge_name(I), N) end,
+                  Counts),
+    aaa_metrics:gauge_set(active_sessions, lists:sum([N || {_, N} <- Counts])),
     ok.
+
+gauge_name(swm) -> active_sessions_swm;
+gauge_name(sta) -> active_sessions_sta;
+gauge_name(s6b) -> active_sessions_s6b.

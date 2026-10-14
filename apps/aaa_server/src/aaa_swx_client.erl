@@ -161,10 +161,13 @@ server_assignment_request(IMSI, AssignmentType, APN, Opts) ->
 %% Diameter callbacks (SWx application on the shared service)
 %%====================================================================
 
-peer_up(_Svc, {_PeerRef, Caps}, State) ->
+peer_up(_Svc, {PeerRef, Caps}, State) ->
     RH = origin_host_cap(Caps),
     logger:notice("SWx peer up: ~s", [RH]),
     aaa_metrics:gauge_inc(swx_peers),
+    %% The service keeps the last event per DRA host; see the
+    %% post-peer-down grace handling in aaa_diameter_svc (KI-40).
+    catch aaa_diameter_svc ! {diameter_peer_up, PeerRef},
     State.
 
 peer_down(_Svc, {PeerRef, Caps}, State) ->

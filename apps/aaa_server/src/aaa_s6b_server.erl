@@ -106,8 +106,25 @@ handle_aar(AVPs, Caps) ->
         apn = APN,
         pgw_id = PGWHost,
         created_ts = 0, updated_ts = 0},
-    aaa_session_mgr:create_session(Rec),
+    case aaa_session_mgr:create_session(Rec) of
+        ok ->
+            %% One S6b session per PDN connection: an earlier session of
+            %% this IMSI and APN (a re-attach the PGW did not end with an
+            %% STR) is replaced (TS 29.273 clause 9).
+            case aaa_session_mgr:supersede_sessions(s6b, IMSI, SessionId, APN) of
+                []  -> ok;
+                Old -> logger:notice("S6b session superseded IMSI=~s APN=~s "
+                                     "new=~s old=~p", [IMSI, APN, SessionId, Old])
+            end,
+            handle_aar_stored(SessionId, IMSI, APN, AuthReqType);
+        {error, Reason} ->
+            logger:error("S6b AAR sid=~s: cannot store session: ~p",
+                         [SessionId, Reason]),
+            aaa_metrics:inc(s6b_auth_failure_total),
+            {reply, aaa_fail(SessionId, IMSI, AuthReqType, 5012)}
+    end.
 
+handle_aar_stored(SessionId, IMSI, APN, AuthReqType) ->
     %% Fetch cached subscription, or pull fresh from HSS via SAR 13.
     CacheLookup = find_cached_profile(IMSI),
     {Non3gpp, APNs} =
@@ -136,14 +153,37 @@ handle_aar(AVPs, Caps) ->
 
 handle_str(AVPs, _Caps) ->
     SessionId = avp('Session-Id', AVPs, <<>>),
-    case aaa_session_mgr:get_session(SessionId) of
-        {ok, #aaa_session{imsi = IMSI}} when is_binary(IMSI) ->
-            _ = aaa_swx_client:server_assignment_request(IMSI, 5, undefined, #{}),
-            aaa_session_mgr:remove_session(SessionId);
+    case aaa_session_mgr:end_session(s6b, SessionId) of
+        {ok, #aaa_session{imsi = IMSI}, Followup} when is_binary(IMSI) ->
+            lists:foreach(fun(F) -> str_followup(F, IMSI) end, Followup);
         _ ->
             ok
     end,
     {reply, sta_response(SessionId, 2001)}.
+
+%% A detach makes the PGW's S6b STR and the ePDG's SWm STR race; the SWm
+%% session is told to go only if it is still there after this delay.
+-define(SWM_ASR_DELAY_MS, 5000).
+
+str_followup(sar_deregistration, IMSI) ->
+    _ = aaa_swx_client:server_assignment_request(IMSI, 5, undefined, #{}),
+    ok;
+str_followup({swm_asr, #aaa_session{session_id = Sid}}, IMSI) ->
+    spawn(fun() ->
+        timer:sleep(?SWM_ASR_DELAY_MS),
+        case aaa_session_mgr:get_session(Sid) of
+            {ok, SwmSession} ->
+                logger:notice("S6b session of IMSI=~s ended while SWm session ~s "
+                              "remains: SWm ASR", [IMSI, Sid]),
+                aaa_metrics:inc(swm_asr_from_s6b_total),
+                aaa_swm_server:emit_abort_session(SwmSession);
+            error ->
+                ok
+        end
+    end),
+    ok;
+str_followup(_, _IMSI) ->
+    ok.
 
 %%====================================================================
 %% Server-initiated ASR / RAR (AAA → PGW)
@@ -254,7 +294,10 @@ aaa_ok(Sid, IMSI, AuthReqType, APNConfig) ->
      {'Origin-Realm', OR},
      {'Auth-Request-Type', AuthReqType},
      {'User-Name', BareIMSI},
-     {'Session-Timeout', session_timeout()},
+     %% The lifetime the AAA keeps the S6b session for. It used to say 1 h
+     %% while the store kept the session for the established lifetime
+     %% (KI-46); the PGW gets the value the store applies.
+     {'Session-Timeout', session_established_timeout()},
      {'MIP6-Feature-Vector', mip6_feature_vector()},
      {'3GPP-AAA-Server-Name', OH},
      {'APN-Configuration', [SafeAPN]}].
@@ -341,4 +384,11 @@ to_bin(B) when is_binary(B) -> B;
 to_bin(L) when is_list(L)   -> list_to_binary(L).
 
 session_timeout()        -> aaa_config:get(session_timeout, 3600).
+
+%% Same rule as aaa_session_mgr:established_ttl/0.
+session_established_timeout() ->
+    case aaa_config:get(session_established_timeout, undefined) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> session_timeout()
+    end.
 mip6_feature_vector()    -> aaa_config:get(mip6_feature_vector, 16#00030000).

@@ -164,7 +164,14 @@ multi(Cmds) when is_list(Cmds) ->
             Pipeline = [[<<"MULTI">>]] ++ Cmds ++ [[<<"EXEC">>]],
             case aaa_redis_worker:qp(W, Pipeline) of
                 Replies when is_list(Replies) ->
-                    parse_multi(Replies);
+                    %% A write refused inside the block (Redis at
+                    %% `maxmemory' answers each queued command with OOM)
+                    %% only shows as EXECABORT on the EXEC reply; hand the
+                    %% refusal itself to the caller.
+                    case [R || {error, <<"OOM", _/binary>> = R} <- Replies] of
+                        [Oom | _] -> {error, Oom};
+                        []        -> parse_multi(Replies)
+                    end;
                 {error, _} = E ->
                     E
             end

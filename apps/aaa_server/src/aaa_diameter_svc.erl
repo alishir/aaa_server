@@ -33,6 +33,8 @@
          trigger_reconnect_all/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
+%% Pure decision rule, exported for the test suite.
+-export([reconnect_decision/3]).
 
 -define(SVC,        aaa_svc).
 -define(VENDOR_3GPP, 10415).
@@ -55,7 +57,10 @@
     dra_hosts = [] :: [string()],
     dra_port :: non_neg_integer() | undefined,
     dra_transport_mod :: module() | undefined,
-    swx_transports = #{} :: #{string() => {term() | undefined, non_neg_integer()}}
+    swx_transports = #{} :: #{string() => {term() | undefined, non_neg_integer()}},
+    %% Last peer_up / peer_down seen per DRA host (unknown until the first
+    %% event). Read when the post-peer-down grace period ends.
+    peer_state = #{} :: #{string() => up | down}
 }).
 
 %%====================================================================
@@ -132,8 +137,14 @@ handle_cast(_Msg, State) -> {noreply, State}.
 
 handle_info({retry_swx, Host}, State) ->
     {noreply, try_connect_swx(Host, State)};
+handle_info({diameter_peer_up, PeerRef},
+            #state{swx_transports = Ts, peer_state = PS} = State) ->
+    case host_for_peer_ref(PeerRef, Ts) of
+        undefined -> {noreply, State};
+        Host      -> {noreply, State#state{peer_state = PS#{Host => up}}}
+    end;
 handle_info({diameter_peer_down, PeerRef},
-            #state{swx_transports = Ts} = State) ->
+            #state{swx_transports = Ts, peer_state = PS} = State) ->
     %% A DRA peer dropped. Map the PeerRef back to one of our outbound
     %% SWx transports (if any) and schedule a DNS re-resolution + rebuild.
     %% If the PeerRef belongs to an inbound listener (e.g. ePDG on SWm,
@@ -147,17 +158,37 @@ handle_info({diameter_peer_down, PeerRef},
               "[dra-reconnect] SWx peer down for ~s — scheduling DNS "
               "re-resolve in 15s", [Host]),
             erlang:send_after(15000, self(), {re_resolve_dra, Host}),
-            {noreply, State}
+            {noreply, State#state{peer_state = PS#{Host => down}}}
     end;
 handle_info({re_resolve_dra, Host},
-            #state{swx_transports = Ts} = State) ->
+            #state{swx_transports = Ts, peer_state = PS} = State) ->
     case maps:find(Host, Ts) of
         {ok, {OldRef, _}} when OldRef =/= undefined ->
-            logger:notice(
-              "[dra-reconnect] re-resolving DRA ~s after peer down", [Host]),
-            catch diameter:remove_transport(?SVC, OldRef),
-            NewTs = Ts#{Host => {undefined, 0}},
-            {noreply, try_connect_swx(Host, State#state{swx_transports = NewTs})};
+            %% OTP's own connect timer (5 s) usually has the connection
+            %% back long before this grace period ends. Rebuilding the
+            %% transport then was a second, self-inflicted outage per peer
+            %% drop, on the connection that also carries the DRA's SWm and
+            %% S6b requests to this AAA (KI-40). Rebuild only when the peer
+            %% is still down or its address changed.
+            TInfos = transport_infos(),
+            case reconnect_decision(maps:get(Host, PS, unknown),
+                                    raddr_for_ref(OldRef, TInfos),
+                                    resolve_host(Host)) of
+                keep ->
+                    logger:notice(
+                      "[dra-reconnect] DRA ~s recovered on its own, "
+                      "keeping the transport", [Host]),
+                    {noreply, State};
+                rebuild ->
+                    logger:notice(
+                      "[dra-reconnect] re-resolving DRA ~s after peer down",
+                      [Host]),
+                    aaa_metrics:inc(dra_transport_rebuilds_total),
+                    catch diameter:remove_transport(?SVC, OldRef),
+                    NewTs = Ts#{Host => {undefined, 0}},
+                    {noreply, try_connect_swx(Host,
+                                              State#state{swx_transports = NewTs})}
+            end;
         _ ->
             %% No ref (transport never came up, or was already torn down);
             %% still attempt a connect so we recover from DNS failure too.
@@ -170,6 +201,7 @@ handle_info({force_reconnect, Host},
             logger:warning(
               "[dra-reconnect] forcing SWx reconnect to DRA ~s "
               "(stale IP detected)", [Host]),
+            aaa_metrics:inc(dra_transport_rebuilds_total),
             catch diameter:remove_transport(?SVC, OldRef),
             NewTs = Ts#{Host => {undefined, 0}},
             {noreply, try_connect_swx(Host, State#state{swx_transports = NewTs})};
@@ -405,14 +437,31 @@ match_peer_ref(Info, PeerRef) ->
             end
     end.
 
+%% Whether a DRA transport is rebuilt (removed and added again with a
+%% fresh DNS answer) or kept. `PeerUp' is the last peer event seen for
+%% the host, `RAddr' the address the transport was opened with, `Dns' the
+%% current lookup result. Keep only when the peer is up and nothing
+%% changed; an unknown peer state rebuilds, so the rule never degrades
+%% to "no reconnect".
+-spec reconnect_decision(up | down | unknown,
+                         inet:ip_address() | undefined,
+                         {ok, inet:ip_address()} | {error, term()}) ->
+          keep | rebuild.
+reconnect_decision(up, RAddr, {ok, RAddr}) when RAddr =/= undefined -> keep;
+reconnect_decision(up, RAddr, {error, _}) when RAddr =/= undefined  -> keep;
+reconnect_decision(_PeerUp, _RAddr, _Dns)                           -> rebuild.
+
+transport_infos() ->
+    case catch diameter:service_info(?SVC, transport) of
+        L when is_list(L) -> L;
+        _ -> []
+    end.
+
 %% For every configured DRA host, compare the current transport's
 %% `raddr' against a fresh DNS lookup. If they differ, queue a
 %% force_reconnect so the transport is rebuilt against the new IP.
 check_stale_dra_ips(#state{dra_hosts = Hosts, swx_transports = Ts}) ->
-    TInfos = case catch diameter:service_info(?SVC, transport) of
-                 L when is_list(L) -> L;
-                 _ -> []
-             end,
+    TInfos = transport_infos(),
     lists:foreach(
       fun(Host) ->
           case maps:get(Host, Ts, undefined) of
@@ -426,15 +475,19 @@ maybe_force_reconnect(Host, Ref, TInfos) ->
     case raddr_for_ref(Ref, TInfos) of
         undefined -> ok;
         RAddr ->
-            case resolve_host(Host) of
-                {ok, CurrentIP} when CurrentIP =/= RAddr ->
+            Dns = resolve_host(Host),
+            %% The health check only acts on an address change; whether
+            %% the peer is up is left to the peer-down path. Hence `up'.
+            case reconnect_decision(up, RAddr, Dns) of
+                rebuild ->
+                    {ok, CurrentIP} = Dns,
                     logger:warning(
                       "[dra-reconnect] stale IP detected for ~s: "
                       "transport raddr=~p, current DNS=~p — "
                       "forcing reconnect",
                       [Host, RAddr, CurrentIP]),
                     self() ! {force_reconnect, Host};
-                _ -> ok
+                keep -> ok
             end
     end.
 

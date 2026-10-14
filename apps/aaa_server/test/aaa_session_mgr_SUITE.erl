@@ -29,7 +29,13 @@
     cross_pod_resume/1,
     ttl_expiry/1,
     multi_atomicity/1,
-    redis_restart_tolerant/1
+    redis_restart_tolerant/1,
+    supersede_replaces_same_interface_session/1,
+    supersede_keeps_other_apn_on_s6b/1,
+    prune_is_chunked_and_single_runner/1,
+    store_full_reports_oom/1,
+    str_followup_deregisters_only_after_the_last_session/1,
+    end_session_reports_what_remains/1
 ]).
 
 -define(TEST_PREFIX, <<"aaa_test:">>).
@@ -46,7 +52,13 @@ all() ->
      cross_pod_resume,
      ttl_expiry,
      multi_atomicity,
-     redis_restart_tolerant].
+     redis_restart_tolerant,
+     supersede_replaces_same_interface_session,
+     supersede_keeps_other_apn_on_s6b,
+     prune_is_chunked_and_single_runner,
+     store_full_reports_oom,
+     str_followup_deregisters_only_after_the_last_session,
+     end_session_reports_what_remains].
 
 init_per_suite(Config) ->
     ok = aaa_metrics:init(),
@@ -105,6 +117,127 @@ end_per_testcase(_TC, Config) ->
         true  -> exit(SupPid, shutdown), wait_gone(SupPid, 50);
         false -> ok
     end,
+    ok.
+
+%%====================================================================
+%% KI-46: sessions of ended attachments stayed in the store
+%%====================================================================
+
+%% A re-attach (new Session-Id) replaces the UE's earlier session on the
+%% same interface; the session on the other interface is untouched.
+supersede_replaces_same_interface_session(_Config) ->
+    IMSI = <<"001010000000050">>,
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"swm-old">>, imsi = IMSI, interface = swm}),
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"s6b-1">>, imsi = IMSI, interface = s6b,
+                         apn = <<"ims">>}),
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"swm-new">>, imsi = IMSI, interface = swm}),
+    [<<"swm-old">>] = aaa_session_mgr:supersede_sessions(swm, IMSI, <<"swm-new">>, undefined),
+    error = aaa_session_mgr:get_session(<<"swm-old">>),
+    {ok, _} = aaa_session_mgr:get_session(<<"swm-new">>),
+    {ok, _} = aaa_session_mgr:get_session(<<"s6b-1">>),
+    1 = aaa_session_mgr:count(swm),
+    %% The alias index no longer points at the removed session.
+    Ids = [S#aaa_session.session_id || S <- aaa_session_mgr:indexed_sessions_for_imsi(IMSI)],
+    [<<"s6b-1">>, <<"swm-new">>] = lists:sort(Ids),
+    %% Nothing to supersede the second time.
+    [] = aaa_session_mgr:supersede_sessions(swm, IMSI, <<"swm-new">>, undefined),
+    ok.
+
+%% On S6b a UE may hold one PDN connection per APN: only the session of
+%% the same APN is replaced.
+supersede_keeps_other_apn_on_s6b(_Config) ->
+    IMSI = <<"001010000000051">>,
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"s6b-ims-old">>, imsi = IMSI,
+                         interface = s6b, apn = <<"ims">>}),
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"s6b-internet">>, imsi = IMSI,
+                         interface = s6b, apn = <<"internet">>}),
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"s6b-ims-new">>, imsi = IMSI,
+                         interface = s6b, apn = <<"ims">>}),
+    [<<"s6b-ims-old">>] = aaa_session_mgr:supersede_sessions(
+                            s6b, IMSI, <<"s6b-ims-new">>, <<"ims">>),
+    {ok, _} = aaa_session_mgr:get_session(<<"s6b-internet">>),
+    {ok, _} = aaa_session_mgr:get_session(<<"s6b-ims-new">>),
+    2 = aaa_session_mgr:count(s6b),
+    ok.
+
+%% The clean-up removes index members whose session expired, reading the
+%% blobs in chunks (1,200 members exceed one chunk), and only the pod
+%% that holds the lock does it.
+prune_is_chunked_and_single_runner(_Config) ->
+    IfaceKey = aaa_redis:key([<<"iface:swm">>]),
+    Live = [list_to_binary("live-" ++ integer_to_list(N)) || N <- lists:seq(1, 600)],
+    Dead = [list_to_binary("dead-" ++ integer_to_list(N)) || N <- lists:seq(1, 600)],
+    lists:foreach(fun(Sid) ->
+        ok = aaa_session_mgr:create_session(
+               #aaa_session{session_id = Sid, imsi = Sid, interface = swm})
+    end, Live),
+    {ok, _} = aaa_redis:q([<<"SADD">>, IfaceKey | Dead]),
+    1200 = aaa_session_mgr:count(swm),
+    %% Another pod holds the lock: this pod must not prune.
+    LockKey = aaa_redis:key([<<"gc:lock">>]),
+    {ok, <<"OK">>} = aaa_redis:q([<<"SET">>, LockKey, <<"other-pod">>, <<"EX">>, <<"30">>]),
+    ok = aaa_session_mgr:run_cleanup(),
+    1200 = aaa_session_mgr:count(swm),
+    %% Lock free: one pass removes every dead member and keeps the live ones.
+    {ok, _} = aaa_redis:q([<<"DEL">>, LockKey]),
+    ok = aaa_session_mgr:run_cleanup(),
+    600 = aaa_session_mgr:count(swm),
+    600 = length(aaa_session_mgr:sessions_by_interface(swm)),
+    %% The pass left its own lock behind, so the next pod skips.
+    {ok, Holder} = aaa_redis:q([<<"GET">>, LockKey]),
+    true = is_binary(Holder),
+    ok.
+
+%% With `maxmemory' reached (policy noeviction) a new session is refused
+%% with a distinct error, so the Diameter handlers can answer
+%% UNABLE_TO_COMPLY instead of crashing.
+store_full_reports_oom(_Config) ->
+    {ok, [_, Before]} = aaa_redis:q([<<"CONFIG">>, <<"GET">>, <<"maxmemory">>]),
+    {ok, _} = aaa_redis:q([<<"CONFIG">>, <<"SET">>, <<"maxmemory">>, <<"1">>]),
+    try
+        {error, redis_oom} = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"oom-1">>, imsi = <<"001010000000052">>,
+                         interface = swm})
+    after
+        {ok, _} = aaa_redis:q([<<"CONFIG">>, <<"SET">>, <<"maxmemory">>, Before])
+    end,
+    ok.
+
+%% TS 29.273: the HSS is told that the user left non-3GPP access (SWx SAR
+%% type 5) when the last session is gone, not when the first one ends;
+%% an S6b end with a SWm session left asks the ePDG to end the tunnel; a
+%% SWm end with an S6b session left waits for the PGW's own STR.
+str_followup_deregisters_only_after_the_last_session(_Config) ->
+    Swm = #aaa_session{session_id = <<"swm">>, imsi = <<"1">>, interface = swm},
+    S6b = #aaa_session{session_id = <<"s6b">>, imsi = <<"1">>, interface = s6b},
+    [sar_deregistration] = aaa_session_mgr:str_followup(swm, []),
+    [sar_deregistration] = aaa_session_mgr:str_followup(s6b, []),
+    [{s6b_grace, S6b}] = aaa_session_mgr:str_followup(swm, [S6b]),
+    [{swm_asr, Swm}] = aaa_session_mgr:str_followup(s6b, [Swm]),
+    %% A second SWm session (re-attach in progress) is nobody's business here.
+    [] = aaa_session_mgr:str_followup(swm, [Swm]),
+    ok.
+
+end_session_reports_what_remains(_Config) ->
+    IMSI = <<"001010000000060">>,
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"e-swm">>, imsi = IMSI, interface = swm}),
+    ok = aaa_session_mgr:create_session(
+            #aaa_session{session_id = <<"e-s6b">>, imsi = IMSI, interface = s6b,
+                         apn = <<"ims">>}),
+    {ok, #aaa_session{interface = swm}, [{s6b_grace, #aaa_session{session_id = <<"e-s6b">>}}]} =
+        aaa_session_mgr:end_session(swm, <<"e-swm">>),
+    error = aaa_session_mgr:get_session(<<"e-swm">>),
+    {ok, #aaa_session{interface = s6b}, [sar_deregistration]} =
+        aaa_session_mgr:end_session(s6b, <<"e-s6b">>),
+    error = aaa_session_mgr:end_session(s6b, <<"e-s6b">>),
+    0 = aaa_session_mgr:count(),
     ok.
 
 %%====================================================================

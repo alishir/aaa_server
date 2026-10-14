@@ -106,8 +106,21 @@ handle_der(AVPs, Caps) ->
     UELocalIP  = fmt_ue_ip(avp('UE-Local-IP-Address', AVPs, undefined)),
 
     EpdgHost = avp('Origin-Host', AVPs, PeerHost),
-    {Session0, _SessionSource} =
-        load_or_create_session_tagged(SessionId, AVPs, EpdgHost),
+    note_epdg_host(EpdgHost),
+    case load_or_create_session_tagged(SessionId, AVPs, EpdgHost) of
+        {error, Reason} ->
+            %% No session record, no authentication: the store is full
+            %% or unreachable. DIAMETER_UNABLE_TO_COMPLY instead of a
+            %% crash per request.
+            logger:error("SWm DER sid=~s: cannot store session: ~p",
+                         [SessionId, Reason]),
+            aaa_metrics:inc(swm_auth_failure_total),
+            {reply, dea_failure(SessionId, <<>>, 5012)};
+        {Session0, _SessionSource} ->
+            handle_der_authenticated(SessionId, EapPayload, UELocalIP, Session0)
+    end.
+
+handle_der_authenticated(SessionId, EapPayload, UELocalIP, Session0) ->
     Result = aaa_eap_relay:process(swm, EapPayload, Session0),
     case Result of
         {challenge, ResponseEAP, Updates} ->
@@ -118,6 +131,15 @@ handle_der(AVPs, Caps) ->
             aaa_metrics:inc(swm_auth_success_total),
             aaa_session_mgr:update_session(SessionId,
                 merge_ue_ip(Updates, UELocalIP)),
+            %% This session is now the UE's SWm session; the ones of an
+            %% earlier attach of the same IMSI are gone (TS 29.273
+            %% clause 7: one SWm session per UE at the 3GPP AAA Server).
+            case aaa_session_mgr:supersede_sessions(
+                   swm, Session0#aaa_session.imsi, SessionId, undefined) of
+                []  -> ok;
+                Old -> logger:notice("SWm session superseded IMSI=~s new=~s old=~p",
+                                     [Session0#aaa_session.imsi, SessionId, Old])
+            end,
             %% Issue SAR already-done inside aaa_eap_relay; fetch cached
             %% subscription to include in the DEA authorization half.
             {reply, dea_success(SessionId, ResponseEAP, MSK, Session0)};
@@ -168,12 +190,36 @@ handle_aar(AVPs, Caps) ->
 %% STR — session termination
 %%====================================================================
 
+%% Grace before an S6b session left behind by a SWm STR is removed: the
+%% PGW's own S6b STR, triggered by the ePDG's S2b Delete, normally arrives
+%% within this time.
+-define(S6B_ORPHAN_GRACE_MS, 60000).
+
+str_followup(sar_deregistration, IMSI) ->
+    _ = aaa_swx_client:server_assignment_request(IMSI, 5, undefined, #{}),
+    ok;
+str_followup({s6b_grace, #aaa_session{session_id = Sid}}, IMSI) ->
+    spawn(fun() ->
+        timer:sleep(?S6B_ORPHAN_GRACE_MS),
+        case aaa_session_mgr:end_session(s6b, Sid) of
+            {ok, _, Followup} ->
+                logger:notice("S6b session ~s of IMSI=~s orphaned after the SWm "
+                              "STR, removed", [Sid, IMSI]),
+                aaa_metrics:inc(sessions_orphaned_total),
+                lists:foreach(fun(F) -> str_followup(F, IMSI) end, Followup);
+            error ->
+                ok
+        end
+    end),
+    ok;
+str_followup(_, _IMSI) ->
+    ok.
+
 handle_str(AVPs, _Caps) ->
     SessionId = avp('Session-Id', AVPs, <<>>),
-    case aaa_session_mgr:get_session(SessionId) of
-        {ok, #aaa_session{imsi = IMSI}} when is_binary(IMSI) ->
-            _ = aaa_swx_client:server_assignment_request(IMSI, 5, undefined, #{}),
-            aaa_session_mgr:remove_session(SessionId);
+    case aaa_session_mgr:end_session(swm, SessionId) of
+        {ok, #aaa_session{imsi = IMSI}, Followup} when is_binary(IMSI) ->
+            lists:foreach(fun(F) -> str_followup(F, IMSI) end, Followup);
         _ ->
             ok
     end,
@@ -254,11 +300,22 @@ emit_abort_for_imsi(IMSI0) ->
             ok
     end.
 
+%% The ePDG hosts seen on SWm. Kept in a small Redis set written at every
+%% DER instead of reading every SWm session for one RTR (KI-46: that was
+%% an MGET of all sessions per RTR without a cached session).
 unique_swm_dest_hosts() ->
-    Hosts = [H || #aaa_session{origin_host = H} <-
-                      aaa_session_mgr:sessions_by_interface(swm),
-                  is_binary(H), H =/= <<>>],
-    lists:usort(Hosts).
+    case aaa_redis:smembers(aaa_redis:key([<<"epdg_hosts">>])) of
+        {ok, Hosts} when is_list(Hosts) -> lists:usort([H || H <- Hosts, is_binary(H), H =/= <<>>]);
+        _ -> []
+    end.
+
+%% Remember an ePDG host for emit_abort_for_imsi/1; refreshed on every DER,
+%% expires a day after the last one.
+note_epdg_host(Host) when is_binary(Host), Host =/= <<>> ->
+    Key = aaa_redis:key([<<"epdg_hosts">>]),
+    _ = aaa_redis:multi([[<<"SADD">>, Key, Host], [<<"EXPIRE">>, Key, <<"86400">>]]),
+    ok;
+note_epdg_host(_) -> ok.
 
 configured_epdg_hosts() ->
     case aaa_config:get(swm_epdg_destination_hosts, []) of
@@ -423,8 +480,10 @@ load_or_create_session_tagged(SessionId, AVPs, PeerHost) ->
                 visited_plmn = avp('Visited-Network-Identifier', AVPs, undefined),
                 ue_local_ip = fmt_ue_ip(avp('UE-Local-IP-Address', AVPs, undefined)),
                 created_ts = 0, updated_ts = 0},
-            ok = aaa_session_mgr:create_session(Rec),
-            {Rec, created}
+            case aaa_session_mgr:create_session(Rec) of
+                ok             -> {Rec, created};
+                {error, _} = E -> E
+            end
     end.
 
 %%====================================================================
